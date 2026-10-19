@@ -337,6 +337,7 @@ def build_all_tools(
         load_manifests,
     )
     from talos_agent.adapters.discord import DiscordAdapter, DiscordAdapterConfig
+    from talos_agent.adapters.mastodon import MastodonAdapter, MastodonAdapterConfig
     from talos_agent.adapters.registry import AdapterRegistry
     from talos_agent.adapters.telegram import TelegramAdapter, TelegramAdapterConfig
     from talos_agent.adapters.telegram_queue import TelegramQueueConfig, TelegramSendQueue
@@ -400,6 +401,20 @@ def build_all_tools(
                     ),
                 )
             )
+        mastodon_config = (getattr(settings, "channel_configs", {}) or {}).get("mastodon", {})
+        if (
+            resolve_setting_secret(settings, "mastodon_access_token")
+            and mastodon_config.get("instance_url", "")
+        ):
+            adapter_registry.register(
+                MastodonAdapter(
+                    MastodonAdapterConfig(
+                        instance_url=mastodon_config["instance_url"],
+                    ),
+                    secrets=sandbox.secrets("mastodon"),
+                    http=sandbox.http("mastodon"),
+                )
+            )
     else:
         adapter_registry = AdapterRegistry()
         adapter_registry.register(XAdapter(browser, settings))
@@ -408,6 +423,12 @@ def build_all_tools(
             or resolve_setting_secret(settings, "discord_bot_token")
         ):
             adapter_registry.register(DiscordAdapter(settings))
+        mastodon_config = (getattr(settings, "channel_configs", {}) or {}).get("mastodon", {})
+        if (
+            resolve_setting_secret(settings, "mastodon_access_token")
+            and mastodon_config.get("instance_url", "")
+        ):
+            adapter_registry.register(MastodonAdapter(settings))
 
     # Inject dependencies into tool modules
     _internal_mod._db = db
