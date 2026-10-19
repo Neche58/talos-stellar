@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, get_type_hints
 
 from talos_agent import metrics
 from talos_agent.config import Settings, resolve_setting_secret
+from talos_agent.http import (
+    DEFAULT_TOOL_TIMEOUT_SECONDS,
+    ToolTimeoutError,
+    call_with_tool_timeout,
+    validate_tool_timeout,
+)
 from talos_agent.tracing import traced_span
 from talos_agent.tools.permissions import (
     EnforcementMode,
@@ -18,26 +23,6 @@ from talos_agent.tools.permissions import (
     PermissionGrants,
     ToolPermissions,
 )
-
-DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
-MAX_TOOL_TIMEOUT_SECONDS = 300.0
-
-
-class _ToolTimeoutError(Exception):
-    """Raised when a tool itself raises TimeoutError, distinct from wait_for expiry."""
-
-
-def _validate_tool_timeout(timeout: float | None) -> float:
-    """Normalize a per-tool timeout, applying the safe default and bound."""
-    if timeout is None:
-        return DEFAULT_TOOL_TIMEOUT_SECONDS
-    timeout = float(timeout)
-    if not math.isfinite(timeout) or timeout <= 0 or timeout > MAX_TOOL_TIMEOUT_SECONDS:
-        raise ValueError(
-            "tool timeout must be finite, greater than 0, and at most "
-            f"{MAX_TOOL_TIMEOUT_SECONDS}; got {timeout}"
-        )
-    return timeout
 
 
 @dataclass
@@ -52,7 +37,7 @@ class Tool:
     timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
-        self.timeout = _validate_tool_timeout(self.timeout)
+        self.timeout = validate_tool_timeout(self.timeout)
 
     def to_openai_schema(self) -> dict:
         return {
@@ -108,7 +93,7 @@ class ToolRegistry:
     ) -> None:
         # Raises ManifestValidationError for a declared-but-unenforceable
         # manifest, so the problem surfaces at import rather than first call.
-        timeout = _validate_tool_timeout(timeout)
+        timeout = validate_tool_timeout(timeout)
         self._enforcer.register(name, permissions)
         self._tools[name] = Tool(
             name=name,
@@ -192,35 +177,25 @@ class ToolRegistry:
                 {"tool.name": name, "tool.arg_keys": list(arguments.keys())},
             ):
                 async def _invoke_tool() -> Any:
-                    try:
-                        if inspect.iscoroutinefunction(tool.fn):
-                            result = await tool.fn(**arguments)
-                        else:
-                            result = await asyncio.to_thread(tool.fn, **arguments)
-                        if inspect.isawaitable(result):
-                            result = await result
-                        return result
-                    except asyncio.TimeoutError as exc:
-                        raise _ToolTimeoutError(str(exc)) from exc
+                    if inspect.iscoroutinefunction(tool.fn):
+                        result = await tool.fn(**arguments)
+                    else:
+                        result = await asyncio.to_thread(tool.fn, **arguments)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return result
 
-                result = await asyncio.wait_for(
-                    _invoke_tool(), timeout=tool.timeout
+                result = await call_with_tool_timeout(
+                    _invoke_tool, tool_name=name, timeout=tool.timeout
                 )
                 return result
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
-        except asyncio.TimeoutError:
+        except ToolTimeoutError:
             outcome = "timeout"
-            return {
-                "error": "Tool execution timed out",
-                "code": "TOOL_TIMEOUT",
-                "tool": name,
-                "timeout_seconds": tool.timeout,
-            }
+            raise
         except Exception as e:
-            if isinstance(e, _ToolTimeoutError) and e.__cause__ is not None:
-                e = e.__cause__
             outcome = "error"
             return {"error": f"{type(e).__name__}: {e}"}
         finally:
